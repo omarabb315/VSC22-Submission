@@ -23,11 +23,20 @@ except ImportError:
     BICUBIC = Image.BICUBIC
 import gc
 
-torch.jit.fuser('off')
-torch._C._jit_override_can_fuse_on_cpu(False)
-torch._C._jit_override_can_fuse_on_gpu(False)
-torch._C._jit_set_texpr_fuser_enabled(False)
-torch._C._jit_set_nvfuser_enabled(False)
+try:
+    torch.jit.fuser('off')
+    torch._C._jit_override_can_fuse_on_cpu(False)
+    torch._C._jit_override_can_fuse_on_gpu(False)
+    torch._C._jit_set_texpr_fuser_enabled(False)
+    torch._C._jit_set_nvfuser_enabled(False)
+except (AttributeError, RuntimeError):
+    pass
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    else "cpu"
+)
 
 import argparse
 
@@ -73,15 +82,15 @@ EMBEDDING_BATCH = 48
 class Main:
 
     def __init__(self):
-        query_subset = pd.read_csv(QUERY_SUBSET_FILE).head(100)
+        query_subset = pd.read_csv(QUERY_SUBSET_FILE)
         query_subset_video_ids = query_subset.video_id.values.astype('U')
-        self.device = torch.device("cuda")
+        self.device = DEVICE
         with open(PCA_MODEL, 'rb') as f:
             self.pca_model = pickle.load(f)
         self.sscd_feature_keys = ["swin_feature", "swin_feature", "swin_feature", "vit_transform"]
         self.sscd_models = []
         for model_str in SSCD_MODELS:
-            self.sscd_models.append(torch.jit.load(model_str).eval().cuda())
+            self.sscd_models.append(torch.jit.load(model_str, map_location=DEVICE).eval().to(DEVICE))
         assert len(self.sscd_models) == len(self.sscd_feature_keys)
         self.swin_transform = transforms.Compose(
             [
@@ -109,13 +118,13 @@ class Main:
         )
         self.cls_model_list = []
         for model_file in CLS_MODEL_LIST:
-            cls_model = torch.jit.load(model_file).eval()
-            cls_model.cuda()
+            cls_model = torch.jit.load(model_file, map_location=DEVICE).eval()
+            cls_model.to(DEVICE)
             self.cls_model_list.append(cls_model)
         self.refine_model_list = []
         for model_file in REFINE_MODEL_LIST:
-            refine_model = torch.jit.load(model_file).eval()
-            refine_model.cuda()
+            refine_model = torch.jit.load(model_file, map_location=DEVICE).eval()
+            refine_model.to(DEVICE)
             self.refine_model_list.append(refine_model)
         self.vid_feature_len_map = {}
 
@@ -138,7 +147,7 @@ class Main:
         timestamp = video_feature['timestamp']
         embed_list = []
         for feature_key, sscd_model in zip(self.sscd_feature_keys, self.sscd_models):
-            sscd_feature = video_feature[feature_key].cuda()
+            sscd_feature = video_feature[feature_key].to(DEVICE)
             embed_list.append(self.single_infer(sscd_model, sscd_feature))
         embed_list = [normalize(x) for x in embed_list]
         embeds = np.concatenate(embed_list, axis=1)
@@ -163,7 +172,7 @@ class Main:
         rid_list = []
         for feature, qids, rids in tqdm.tqdm(cls_dataloader):
             with torch.no_grad():
-                pred_list_ = [model(feature.cuda()).cpu() for model in self.cls_model_list]
+                pred_list_ = [model(feature.to(DEVICE)).cpu() for model in self.cls_model_list]
                 pred_list_ = [x.softmax(axis=1)[:, 1] for x in pred_list_]
                 pred_list.append(sum(pred_list_) / len(pred_list_))
                 qid_list.extend(list(qids))
@@ -181,7 +190,7 @@ class Main:
         res_list = []
         for feature, qid, rid, h, w in tqdm.tqdm(testloader):
             with torch.no_grad():
-                feature_ = feature.cuda()
+                feature_ = feature.to(DEVICE)
                 pred_list = []
                 for model in self.refine_model_list:
                     pred = model(feature_).cpu()
@@ -208,7 +217,8 @@ class Main:
         for feature in tqdm.tqdm(self.dataloader):
             for fea in feature:
                 query_list.append(self.process_feature(fea))
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         score_norm_refs = load_features(NORM_DATA_FILE, Dataset.REFS)
         low_var_dim = calclualte_low_var_dim(score_norm_refs) # should be consisent with ref features
         sn_query_list = query_score_normalize(query_list, score_norm_refs, low_var_dim, beta=1.5, nk=10)
@@ -224,6 +234,8 @@ class Main:
         gc.collect()
         if faiss.get_num_gpus() > 0:
             index_gpu = faiss.index_cpu_to_all_gpus(index_cpu)
+        else:
+            index_gpu = index_cpu
         search_res_map = {}
         k = min(index_gpu.ntotal, 1024)
         for vf in tqdm.tqdm(sn_query_list):
@@ -259,7 +271,8 @@ class Main:
         search_res_df.to_csv('match_candidates_score.csv', index=False)
         del index_cpu
         del index_gpu
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
         refs = load_features(REF_DATA_FILE, Dataset.REFS)
         query_list, refs = [
@@ -277,7 +290,8 @@ class Main:
         candidate_score_list = list(zip(select_cand.query_id.values, select_cand.ref_id.values, select_cand.prob.values))
         match_meta = generate_matching_feature(
             query_map, ref_map,  self.vid_feature_len_map, candidate_score_list)
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         match_refine_res = self.match_refine(match_meta)
         match_res_high = generate_matching_result(match_refine_res, threshold=MATCH_REFINE_THRESHOLD_HIGH, std_ratio=0.5)
         match_res_mid = generate_matching_result(match_refine_res, threshold=MATCH_REFINE_THRESHOLD_MID, std_ratio=1.25)

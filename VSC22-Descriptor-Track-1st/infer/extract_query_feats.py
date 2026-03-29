@@ -25,11 +25,20 @@ try:
 except ImportError:
     BICUBIC = Image.BICUBIC
 
-torch.jit.fuser('off')
-torch._C._jit_override_can_fuse_on_cpu(False)
-torch._C._jit_override_can_fuse_on_gpu(False)
-torch._C._jit_set_texpr_fuser_enabled(False)
-torch._C._jit_set_nvfuser_enabled(False)
+try:
+    torch.jit.fuser('off')
+    torch._C._jit_override_can_fuse_on_cpu(False)
+    torch._C._jit_override_can_fuse_on_gpu(False)
+    torch._C._jit_set_texpr_fuser_enabled(False)
+    torch._C._jit_set_nvfuser_enabled(False)
+except (AttributeError, RuntimeError):
+    pass
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    else "cpu"
+)
 
 import argparse
 
@@ -73,14 +82,14 @@ class Main:
         query_subset = pd.read_csv(QUERY_SUBSET_FILE)
         query_subset_video_ids = query_subset.video_id.values.astype('U')
         
-        self.device = torch.device("cuda")
-        self.clip_model = torch.jit.load(CLIP_MODEL)
+        self.device = DEVICE
+        self.clip_model = torch.jit.load(CLIP_MODEL, map_location=DEVICE)
         self.clip_model.eval()
-        self.clip_model.cuda()
+        self.clip_model.to(DEVICE)
 
-        self.video_score_model = torch.jit.load(VIDEO_SCORE_MODEL)
+        self.video_score_model = torch.jit.load(VIDEO_SCORE_MODEL, map_location=DEVICE)
         self.video_score_model.eval()
-        self.video_score_model.cuda()
+        self.video_score_model.to(DEVICE)
 
         with open(PCA_MODEL, 'rb') as f:
             self.pca_model = pickle.load(f)
@@ -89,7 +98,7 @@ class Main:
 
         self.sscd_models = dict()
         for i,k in enumerate(self.sscd_feature_keys):
-            self.sscd_models[k] = torch.jit.load(SSCD_MODELS[i]).eval().cuda() # TODO right?
+            self.sscd_models[k] = torch.jit.load(SSCD_MODELS[i], map_location=DEVICE).eval().to(DEVICE)
 
         self.video_score_transform = transforms.Compose([
             transforms.Resize(224, interpolation=BICUBIC),
@@ -154,9 +163,9 @@ class Main:
 
     def process(self, video_feature):
         timestamp = video_feature['timestamp']
-        frames_tensor = video_feature['video_score_feature'].cuda()
+        frames_tensor = video_feature['video_score_feature'].to(DEVICE)
         num_frames = len(frames_tensor)
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.amp.autocast(device_type=DEVICE.type, enabled=DEVICE.type == "cuda"):
             flat_feature = self.clip_model(frames_tensor[:256,...])[:, 0] # TODO check check
         if(num_frames <= 256): # TODO check check
             flat_feature = F.pad(flat_feature, pad=(0, 0, 0, 256 - num_frames))
@@ -168,7 +177,7 @@ class Main:
 
         sub_features = []
         for k in self.sscd_feature_keys:
-            sscd_feature = video_feature[k].cuda() # TODO
+            sscd_feature = video_feature[k].to(DEVICE)
             sub_feature = normalize(self.single_infer(self.sscd_models[k],sscd_feature))
             sub_features.append(sub_feature)
 
@@ -227,7 +236,8 @@ class Main:
                 feat, sub_feats = self.process(fea)
                 feature_list.append(feat)
                 sub_feature_list.append(sub_feats)
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # save_sub_features
         for i, k in enumerate(SSCD_MODELS):
             sub_feat = [x[i] for x in sub_feature_list]

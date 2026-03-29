@@ -1,5 +1,7 @@
 projectdir=./
 export PYTHONPATH=$PYTHONPATH:$projectdir
+export KMP_DUPLICATE_LIB_OK=TRUE
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 
 # gt_path="../data/meta/val/eval_matches.csv"
 # python3 -m vsc.baseline.sscd_baseline \

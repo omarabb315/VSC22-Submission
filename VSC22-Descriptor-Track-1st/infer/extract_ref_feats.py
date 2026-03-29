@@ -15,27 +15,53 @@ from vsc.storage import load_features,store_features
 
 TRANSFORMS = {"imagenet":sscd_transform,"effnet":eff_transform,'vit':vit_transform}
 
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    else "cpu"
+)
+
+IS_DISTRIBUTED = "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1
+
+
 def main(args):
-    world_size = int(os.environ['WORLD_SIZE'])
-    torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://',rank=args.local_rank,world_size=world_size)
-    device = torch.device("cuda",args.local_rank)
-    checkpoint_path = args.checkpoint_path # './checkpoints/sscd_v60.torchscript.pt'
-    model = torch.jit.load(checkpoint_path)
+    if IS_DISTRIBUTED:
+        world_size = int(os.environ['WORLD_SIZE'])
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://',rank=args.local_rank,world_size=world_size)
+        device = torch.device("cuda", args.local_rank)
+    else:
+        world_size = 1
+        args.local_rank = 0
+        device = DEVICE
+
+    checkpoint_path = args.checkpoint_path
+    model = torch.jit.load(checkpoint_path, map_location=device)
     model.to(device)
-    model = DDP(model,device_ids=[args.local_rank],output_device=args.local_rank,find_unused_parameters=True)
+
+    if IS_DISTRIBUTED:
+        model = DDP(model,device_ids=[args.local_rank],output_device=args.local_rank,find_unused_parameters=True)
+
     model.eval()
     img_size = args.img_size
     with open(args.input_file, "r", encoding="utf-8") as f:
         vids = [x.strip() for x in f]
     dataset = D_vsc(vids,args.zip_prefix,img_size=img_size,transform=TRANSFORMS[args.transform](args.img_size,args.img_size),max_video_frames=256)
-    dataloader = DataLoader(dataset,batch_size=args.batch_size,num_workers=4,drop_last=False, pin_memory=False, # ,prefetch_factor=4,
-                            sampler=DistributedSampler(dataset,shuffle=False),collate_fn=dataset.collate_fn)
+
+    if IS_DISTRIBUTED:
+        sampler = DistributedSampler(dataset, shuffle=False)
+    else:
+        sampler = None
+
+    dataloader = DataLoader(dataset,batch_size=args.batch_size,num_workers=4,drop_last=False, pin_memory=False,
+                            sampler=sampler, collate_fn=dataset.collate_fn)
     vids,features,timestamps = extract_vsc_feat(model,dataloader,device)
     np.savez(args.save_file+f'_{args.local_rank}.npz',video_ids=vids,features=features,timestamps=timestamps)
-    dist.barrier()
-    if(args.local_rank == 0):
-        # merge sub files and remove
+
+    if IS_DISTRIBUTED:
+        dist.barrier()
+
+    if args.local_rank == 0:
         feats = []
         vids = []
         timestamps = []
@@ -48,7 +74,7 @@ def main(args):
             feats.append(partial_data['features'])
             del partial_data
             print("To remove: ",file)
-            os.remove(file) # remove sub files
+            os.remove(file)
         feats = np.concatenate(feats)
         timestamps = np.array(timestamps)
         np.savez(args.save_file+'.npz',video_ids=vids,features=feats,timestamps=timestamps)
@@ -67,8 +93,8 @@ if __name__ == '__main__':
     parser.add_argument('--save_file_root', default="./outputs")
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--img_size',type=int,default=320)
-    parser.add_argument("--local_rank", type=int, default=-1,
-                        help="For distributed training: local_rank")
+    parser.add_argument("--local_rank", type=int,
+                        default=int(os.environ.get("LOCAL_RANK", -1)))
     parser.add_argument('--dataset',type=str,default='vsc')
     parser.add_argument('--transform',type=str,default='imagenet')
     
