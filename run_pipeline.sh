@@ -6,9 +6,18 @@ cd "$REPO_ROOT"
 
 source vsc22_env/bin/activate
 
-# Avoid OMP crash on macOS with multiple linked OpenMP libraries
+# OpenMP: macOS often needs a single thread + KMP_DUPLICATE_LIB_OK (duplicate runtimes).
+# Linux/H200: allow more CPU threads for numpy/sklearn; override with OMP_NUM_THREADS if needed.
 export KMP_DUPLICATE_LIB_OK=TRUE
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+else
+    _c=$(nproc 2>/dev/null || echo 8)
+    [ "${_c}" -gt 16 ] && _c=16
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${_c}}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${OMP_NUM_THREADS}}"
+fi
 
 VCDB_DIR="${1:-vcdb_core}"
 MAX_VIDEOS="${2:-}"
